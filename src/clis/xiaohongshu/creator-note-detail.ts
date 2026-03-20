@@ -223,12 +223,14 @@ export function appendAudienceRows(rows: CreatorNoteDetailRow[], payload?: NoteD
 
 function formatTrendTimestamp(ts: number | undefined, granularity: 'hour' | 'day'): string {
   if (!ts) return '';
-  const date = new Date(ts);
+  // Use fixed UTC+8 offset to ensure consistent output regardless of CI server timezone.
+  const CST_OFFSET_MS = 8 * 60 * 60 * 1000;
+  const cstDate = new Date(ts + CST_OFFSET_MS);
   const pad = (value: number) => String(value).padStart(2, '0');
   if (granularity === 'hour') {
-    return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:00`;
+    return `${pad(cstDate.getUTCMonth() + 1)}-${pad(cstDate.getUTCDate())} ${pad(cstDate.getUTCHours())}:00`;
   }
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+  return `${cstDate.getUTCFullYear()}-${pad(cstDate.getUTCMonth() + 1)}-${pad(cstDate.getUTCDate())}`;
 }
 
 function formatTrendSeries(points: NoteTrendPoint[] | undefined, granularity: 'hour' | 'day'): string {
