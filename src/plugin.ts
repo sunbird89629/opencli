@@ -459,6 +459,68 @@ function postInstallMonorepoLifecycle(repoDir: string, pluginDirs: string[]): vo
   }
 }
 
+function ensureStandalonePluginReady(pluginDir: string): void {
+  const validation = validatePluginStructure(pluginDir);
+  if (!validation.valid) {
+    throw new Error(`Invalid plugin structure:\n- ${validation.errors.join('\n- ')}`);
+  }
+
+  postInstallLifecycle(pluginDir);
+}
+
+type LockEntryInput = Omit<LockEntry, 'installedAt'> & Partial<Pick<LockEntry, 'installedAt'>>;
+
+function upsertLockEntry(
+  lock: Record<string, LockEntry>,
+  name: string,
+  entry: LockEntryInput,
+): void {
+  lock[name] = {
+    ...entry,
+    installedAt: entry.installedAt ?? new Date().toISOString(),
+  };
+}
+
+function publishStandalonePlugin(
+  stagingDir: string,
+  targetDir: string,
+  writeLock: (commitHash: string | undefined) => void,
+): void {
+  runTransaction((tx) => {
+    tx.track(beginReplaceDir(stagingDir, targetDir));
+    writeLock(getCommitHash(targetDir));
+  });
+}
+
+interface MonorepoPublishPlugin {
+  name: string;
+  subPath: string;
+}
+
+function publishMonorepoPlugins(
+  repoDir: string,
+  pluginsDir: string,
+  plugins: MonorepoPublishPlugin[],
+  publishRepo?: { stagingDir: string; parentDir: string },
+  writeLock?: (commitHash: string | undefined) => void,
+): void {
+  runTransaction((tx) => {
+    if (publishRepo) {
+      fs.mkdirSync(publishRepo.parentDir, { recursive: true });
+      tx.track(beginReplaceDir(publishRepo.stagingDir, repoDir));
+    }
+
+    const commitHash = getCommitHash(repoDir);
+    for (const plugin of plugins) {
+      const linkPath = path.join(pluginsDir, plugin.name);
+      const subDir = path.join(repoDir, plugin.subPath);
+      tx.track(beginReplaceSymlink(subDir, linkPath));
+    }
+
+    writeLock?.(commitHash);
+  });
+}
+
 /**
  * Install a plugin from a source.
  * Supports:
@@ -526,23 +588,14 @@ function installSinglePlugin(
     throw new Error(`Plugin "${pluginName}" is already installed at ${targetDir}`);
   }
 
-  const validation = validatePluginStructure(cloneDir);
-  if (!validation.valid) {
-    throw new Error(`Invalid plugin structure:\n- ${validation.errors.join('\n- ')}`);
-  }
-
-  postInstallLifecycle(cloneDir);
-  runTransaction((tx) => {
-    tx.track(beginReplaceDir(cloneDir, targetDir));
+  ensureStandalonePluginReady(cloneDir);
+  publishStandalonePlugin(cloneDir, targetDir, (commitHash) => {
     const lock = readLockFile();
-    const commitHash = getCommitHash(targetDir);
-
     if (commitHash) {
-      lock[pluginName] = {
+      upsertLockEntry(lock, pluginName, {
         source: cloneUrl,
         commitHash,
-        installedAt: new Date().toISOString(),
-      };
+      });
       writeLockFile(lock);
     }
   });
@@ -596,11 +649,10 @@ function installLocalPlugin(localPath: string, name: string): string {
 
   const lock = readLockFile();
   const commitHash = getCommitHash(localPath);
-  lock[pluginName] = {
+  upsertLockEntry(lock, pluginName, {
     source: toLocalPluginSource(resolvedPath),
     commitHash: commitHash ?? 'local',
-    installedAt: new Date().toISOString(),
-  };
+  });
   writeLockFile(lock);
 
   return pluginName;
@@ -621,12 +673,12 @@ function updateLocalPlugin(
 
   postInstallLifecycle(pluginDir);
 
-  lock[name] = {
+  upsertLockEntry(lock, name, {
     source: lockEntry?.source ?? toLocalPluginSource(pluginDir),
     commitHash: getCommitHash(pluginDir) ?? 'local',
     installedAt: lockEntry?.installedAt ?? new Date().toISOString(),
     updatedAt: new Date().toISOString(),
-  };
+  });
   writeLockFile(lock);
 }
 
@@ -703,42 +755,113 @@ function installMonorepo(
     return installedNames;
   }
 
+  const publishPlugins = eligiblePlugins.map(({ name, entry }) => ({ name, subPath: entry.path }));
+
   if (repoAlreadyInstalled) {
     postInstallMonorepoLifecycle(repoDir, eligiblePlugins.map((p) => path.join(repoDir, p.entry.path)));
   } else {
     postInstallMonorepoLifecycle(cloneDir, eligiblePlugins.map((p) => path.join(cloneDir, p.entry.path)));
   }
 
-  runTransaction((tx) => {
-    if (!repoAlreadyInstalled) {
-      fs.mkdirSync(monoreposDir, { recursive: true });
-      tx.track(beginReplaceDir(cloneDir, repoDir));
-    }
-
-    const commitHash = getCommitHash(repoDir);
-
-    for (const { name, entry } of eligiblePlugins) {
-      const linkPath = path.join(PLUGINS_DIR, name);
-      const subDir = path.join(repoDir, entry.path);
-
-      tx.track(beginReplaceSymlink(subDir, linkPath));
-
-      if (commitHash) {
-        lock[name] = {
-          source: cloneUrl,
-          commitHash,
-          installedAt: new Date().toISOString(),
-          monorepo: { name: repoName, subPath: entry.path },
-        };
+  publishMonorepoPlugins(
+    repoDir,
+    PLUGINS_DIR,
+    publishPlugins,
+    repoAlreadyInstalled ? undefined : { stagingDir: cloneDir, parentDir: monoreposDir },
+    (commitHash) => {
+      for (const { name, entry } of eligiblePlugins) {
+        if (commitHash) {
+          upsertLockEntry(lock, name, {
+            source: cloneUrl,
+            commitHash,
+            monorepo: { name: repoName, subPath: entry.path },
+          });
+        }
+        installedNames.push(name);
       }
-
-      installedNames.push(name);
-    }
-
-    writeLockFile(lock);
-  });
+      writeLockFile(lock);
+    },
+  );
 
   return installedNames;
+}
+
+function collectUpdatedMonorepoPlugins(
+  monoName: string,
+  lock: Record<string, LockEntry>,
+  manifest: PluginManifest,
+  cloneUrl: string,
+  tmpCloneDir: string,
+): Array<{
+  name: string;
+  lockEntry: LockEntry;
+  manifestEntry: NonNullable<PluginManifest['plugins']>[string];
+}> {
+  const updatedPlugins: Array<{
+    name: string;
+    lockEntry: LockEntry;
+    manifestEntry: NonNullable<PluginManifest['plugins']>[string];
+  }> = [];
+
+  for (const [pluginName, entry] of Object.entries(lock)) {
+    if (entry.monorepo?.name !== monoName) continue;
+    const manifestEntry = manifest.plugins?.[pluginName];
+    if (!manifestEntry || manifestEntry.disabled) {
+      throw new Error(`Installed sub-plugin "${pluginName}" no longer exists in ${cloneUrl}`);
+    }
+    if (manifestEntry.opencli && !checkCompatibility(manifestEntry.opencli)) {
+      throw new Error(`Sub-plugin "${pluginName}" requires opencli ${manifestEntry.opencli}`);
+    }
+
+    const subDir = path.join(tmpCloneDir, manifestEntry.path);
+    const validation = validatePluginStructure(subDir);
+    if (!validation.valid) {
+      throw new Error(`Updated sub-plugin "${pluginName}" is invalid:\n- ${validation.errors.join('\n- ')}`);
+    }
+    updatedPlugins.push({ name: pluginName, lockEntry: entry, manifestEntry });
+  }
+
+  return updatedPlugins;
+}
+
+function updateMonorepoLockEntries(
+  lock: Record<string, LockEntry>,
+  plugins: Array<{
+    name: string;
+    lockEntry: LockEntry;
+    manifestEntry: NonNullable<PluginManifest['plugins']>[string];
+  }>,
+  cloneUrl: string,
+  monoName: string,
+  commitHash: string | undefined,
+): void {
+  for (const plugin of plugins) {
+    if (!commitHash) continue;
+    upsertLockEntry(lock, plugin.name, {
+      ...plugin.lockEntry,
+      source: cloneUrl,
+      commitHash,
+      updatedAt: new Date().toISOString(),
+      monorepo: { name: monoName, subPath: plugin.manifestEntry.path },
+    });
+  }
+}
+
+function updateStandaloneLockEntry(
+  lock: Record<string, LockEntry>,
+  name: string,
+  cloneUrl: string,
+  existing: LockEntry | undefined,
+  commitHash: string | undefined,
+): void {
+  if (!commitHash) return;
+
+  upsertLockEntry(lock, name, {
+    source: cloneUrl,
+    commitHash,
+    installedAt: existing?.installedAt ?? new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
 }
 
 /**
@@ -827,53 +950,28 @@ export function updatePlugin(name: string): void {
         );
       }
 
-      const updatedPlugins: Array<{
-        name: string;
-        lockEntry: LockEntry;
-        manifestEntry: NonNullable<PluginManifest['plugins']>[string];
-      }> = [];
-      for (const [pluginName, entry] of Object.entries(lock)) {
-        if (entry.monorepo?.name !== monoName) continue;
-        const manifestEntry = manifest.plugins?.[pluginName];
-        if (!manifestEntry || manifestEntry.disabled) {
-          throw new Error(`Installed sub-plugin "${pluginName}" no longer exists in ${cloneUrl}`);
-        }
-        if (manifestEntry.opencli && !checkCompatibility(manifestEntry.opencli)) {
-          throw new Error(`Sub-plugin "${pluginName}" requires opencli ${manifestEntry.opencli}`);
-        }
-
-        const subDir = path.join(tmpCloneDir, manifestEntry.path);
-        const validation = validatePluginStructure(subDir);
-        if (!validation.valid) {
-          throw new Error(`Updated sub-plugin "${pluginName}" is invalid:\n- ${validation.errors.join('\n- ')}`);
-        }
-        updatedPlugins.push({ name: pluginName, lockEntry: entry, manifestEntry });
-      }
+      const updatedPlugins = collectUpdatedMonorepoPlugins(
+        monoName,
+        lock,
+        manifest,
+        cloneUrl,
+        tmpCloneDir,
+      );
 
       if (updatedPlugins.length > 0) {
         postInstallMonorepoLifecycle(tmpCloneDir, updatedPlugins.map((plugin) => path.join(tmpCloneDir, plugin.manifestEntry.path)));
       }
 
-      runTransaction((tx) => {
-        tx.track(beginReplaceDir(tmpCloneDir, monoDir));
-        const commitHash = getCommitHash(monoDir);
-        for (const plugin of updatedPlugins) {
-          const linkPath = path.join(PLUGINS_DIR, plugin.name);
-          const subDir = path.join(monoDir, plugin.manifestEntry.path);
-          tx.track(beginReplaceSymlink(subDir, linkPath));
-
-          if (commitHash) {
-            lock[plugin.name] = {
-              ...plugin.lockEntry,
-              source: cloneUrl,
-              commitHash,
-              updatedAt: new Date().toISOString(),
-              monorepo: { name: monoName, subPath: plugin.manifestEntry.path },
-            };
-          }
-        }
-        writeLockFile(lock);
-      });
+      publishMonorepoPlugins(
+        monoDir,
+        PLUGINS_DIR,
+        updatedPlugins.map((plugin) => ({ name: plugin.name, subPath: plugin.manifestEntry.path })),
+        { stagingDir: tmpCloneDir, parentDir: path.dirname(monoDir) },
+        (commitHash) => {
+          updateMonorepoLockEntries(lock, updatedPlugins, cloneUrl, monoName, commitHash);
+          writeLockFile(lock);
+        },
+      );
     });
     return;
   }
@@ -891,23 +989,10 @@ export function updatePlugin(name: string): void {
       );
     }
 
-    const validation = validatePluginStructure(tmpCloneDir);
-    if (!validation.valid) {
-      throw new Error(`Updated plugin structure is invalid:\n- ${validation.errors.join('\n- ')}`);
-    }
-
-    postInstallLifecycle(tmpCloneDir);
-    runTransaction((tx) => {
-      tx.track(beginReplaceDir(tmpCloneDir, targetDir));
-      const commitHash = getCommitHash(targetDir);
+    ensureStandalonePluginReady(tmpCloneDir);
+    publishStandalonePlugin(tmpCloneDir, targetDir, (commitHash) => {
+      updateStandaloneLockEntry(lock, name, cloneUrl, lock[name], commitHash);
       if (commitHash) {
-        const existing = lock[name];
-        lock[name] = {
-          source: cloneUrl,
-          commitHash,
-          installedAt: existing?.installedAt ?? new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
         writeLockFile(lock);
       }
     });
