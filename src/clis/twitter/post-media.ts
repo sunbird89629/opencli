@@ -34,8 +34,6 @@ cli({
     if (!page) throw new CommandExecutionError('Browser session required');
 
     const filePath = path.resolve(kwargs.media as string);
-    if (!fs.existsSync(filePath)) throw new CommandExecutionError(`File not found: ${filePath}`);
-
     const ext = path.extname(filePath).toLowerCase();
     const mimeType = MIME_TYPES[ext];
     if (!mimeType) {
@@ -43,13 +41,17 @@ cli({
     }
 
     const fileName = path.basename(filePath);
-    const fileBuffer = fs.readFileSync(filePath);
+    let fileBuffer: Buffer;
+    try {
+      fileBuffer = fs.readFileSync(filePath);
+    } catch {
+      throw new CommandExecutionError(`File not found: ${filePath}`);
+    }
     const totalChunks = Math.ceil(fileBuffer.length / CHUNK_SIZE);
 
     await page.goto('https://x.com/compose/tweet');
     await page.wait(3);
 
-    // Enter tweet text
     const textResult = await page.evaluate(`(async () => {
       const box = document.querySelector('[data-testid="tweetTextarea_0"]');
       if (!box) return { ok: false, error: 'Tweet composer not found' };
@@ -66,7 +68,6 @@ cli({
 
     await page.wait(1);
 
-    // Buffer file into browser memory in chunks
     await page.evaluate(`window.__mediaChunks = [];`);
     process.stdout.write(`  Reading file (${Math.round(fileBuffer.length / 1024 / 1024)}MB)...\n`);
     for (let i = 0; i < totalChunks; i++) {
@@ -76,7 +77,6 @@ cli({
     }
     process.stdout.write('\n');
 
-    // Click media button to activate the file input
     const mediaBtn = await page.evaluate(`(() => {
       const btn = document.querySelector('[data-testid="attachments"]')
         || document.querySelector('input[type="file"]')?.closest('label')
@@ -88,7 +88,6 @@ cli({
 
     if (mediaBtn) await page.wait(1);
 
-    // Inject file via DataTransfer into the hidden file input
     const injectResult = await page.evaluate(`(async () => {
       try {
         const chunks = window.__mediaChunks;
@@ -133,7 +132,6 @@ cli({
       throw new CommandExecutionError(`Media inject failed: ${(injectResult as { error?: string }).error}`);
     }
 
-    // Wait for Twitter to upload the file
     process.stdout.write('  Waiting for upload');
     await page.wait(3);
     for (let i = 0; i < 120; i++) {
@@ -155,7 +153,6 @@ cli({
 
     await page.wait(2);
 
-    // Click Post
     const postResult = await page.evaluate(`(() => {
       const btn = document.querySelector('[data-testid="tweetButton"]')
         || document.querySelector('[data-testid="tweetButtonInline"]');
