@@ -1,5 +1,7 @@
 import { cli, Strategy } from '../../registry.js';
+import { ArgumentError } from '../../errors.js';
 import type { IPage } from '../../types.js';
+import { browserFetch } from './_shared/browser-fetch.js';
 
 cli({
   site: 'douyin',
@@ -13,31 +15,35 @@ cli({
   ],
   columns: ['index', 'aweme_id', 'title', 'duration', 'digg_count', 'play_url', 'top_comments'],
   func: async (page: IPage, kwargs) => {
+    const limit = Number(kwargs.limit);
+    if (!Number.isInteger(limit) || limit <= 0) {
+      throw new ArgumentError('limit must be a positive integer');
+    }
+
     await page.goto(`https://www.douyin.com/user/${kwargs.sec_uid as string}`);
     await page.wait(3);
 
+    const params = new URLSearchParams({
+      sec_user_id: String(kwargs.sec_uid),
+      max_cursor: '0',
+      count: String(limit),
+      aid: '6383',
+    });
+    const data = await browserFetch(
+      page,
+      'GET',
+      `https://www.douyin.com/aweme/v1/web/aweme/post/?${params.toString()}`,
+    ) as { aweme_list?: Array<Record<string, unknown>> };
+    const awemeList = (data.aweme_list || []).slice(0, limit);
+
     const result = await page.evaluate(`
       (async () => {
-        const secUid = ${JSON.stringify(kwargs.sec_uid)};
-        const limit = ${JSON.stringify(kwargs.limit)};
-
-        const params = new URLSearchParams({
-          sec_user_id: secUid,
-          max_cursor: '0',
-          count: String(limit),
-          aid: '6383',
-        });
-        const res = await fetch('/aweme/v1/web/aweme/post/?' + params.toString(), {
-          credentials: 'include',
-          headers: { referer: 'https://www.douyin.com/' },
-        });
-        const data = await res.json();
-        const awemeList = (data.aweme_list || []).slice(0, limit);
+        const awemeList = ${JSON.stringify(awemeList)};
 
         const withComments = await Promise.all(awemeList.map(async (v) => {
           try {
             const cp = new URLSearchParams({
-              aweme_id: v.aweme_id,
+              aweme_id: String(v.aweme_id),
               count: '10',
               cursor: '0',
               aid: '6383',
