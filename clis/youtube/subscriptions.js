@@ -3,6 +3,7 @@
  */
 import { cli, Strategy } from '@jackwener/opencli/registry';
 import { CommandExecutionError, EmptyResultError } from '@jackwener/opencli/errors';
+import { extractSubscriptionChannel } from './utils.js';
 
 cli({
     site: 'youtube',
@@ -32,24 +33,12 @@ cli({
           ?.shelfRenderer?.content
           ?.expandedShelfContentsRenderer?.items || [];
 
-        function extractChannel(item) {
-          const ch = item.channelRenderer;
-          if (!ch) return null;
-          const name = ch.title?.simpleText || '';
-          const handle = ch.subscriberCountText?.simpleText || '';  // confusingly stores handle
-          const subscribers = ch.videoCountText?.simpleText || '';  // confusingly stores subscriber count
-          const baseUrl = ch.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl || '';
-          const channelId = ch.channelId || ch.navigationEndpoint?.browseEndpoint?.browseId || '';
-          const url = baseUrl
-            ? 'https://www.youtube.com' + baseUrl
-            : channelId ? 'https://www.youtube.com/channel/' + channelId : '';
-          return { name, handle, subscribers, url };
-        }
+        const extractChannel = ${extractSubscriptionChannel.toString()};
 
         const channels = [];
         for (const item of items) {
           if (channels.length >= limit) break;
-          const ch = extractChannel(item);
+          const ch = extractChannel(item.channelRenderer);
           if (ch?.name) channels.push(ch);
         }
 

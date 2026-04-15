@@ -128,6 +128,46 @@ export function extractPlaylistVideos(items) {
     });
 }
 /**
+ * Normalize a subscribed channel entry from YouTube's channelRenderer payload.
+ * Different surfaces/locales may expose the handle in channelHandleText, canonicalBaseUrl,
+ * or, in some variants, overload one of the count fields with an @handle string.
+ */
+export function extractSubscriptionChannel(channelRenderer) {
+    const readText = (value) => {
+        if (!value)
+            return '';
+        if (typeof value.simpleText === 'string')
+            return value.simpleText.trim();
+        if (Array.isArray(value.runs)) {
+            return value.runs
+                .map((run) => run?.text || '')
+                .join('')
+                .trim();
+        }
+        return '';
+    };
+    const ch = channelRenderer || {};
+    const name = readText(ch.title);
+    const baseUrl = ch.navigationEndpoint?.browseEndpoint?.canonicalBaseUrl || '';
+    const channelId = ch.channelId || ch.navigationEndpoint?.browseEndpoint?.browseId || '';
+    const subscriberCountText = readText(ch.subscriberCountText);
+    const videoCountText = readText(ch.videoCountText);
+    const handle = [
+        readText(ch.channelHandleText),
+        baseUrl.startsWith('/@') ? baseUrl.slice(1) : '',
+        subscriberCountText.startsWith('@') ? subscriberCountText : '',
+        videoCountText.startsWith('@') ? videoCountText : '',
+    ].find(Boolean) || '';
+    const subscribers = [
+        !subscriberCountText.startsWith('@') ? subscriberCountText : '',
+        !videoCountText.startsWith('@') ? videoCountText : '',
+    ].find(Boolean) || '';
+    const url = baseUrl
+        ? 'https://www.youtube.com' + baseUrl
+        : channelId ? 'https://www.youtube.com/channel/' + channelId : '';
+    return { name, handle, subscribers, url };
+}
+/**
  * Inline @handle → channelId resolver for use inside page.evaluate() strings.
  * Inject via RESOLVE_CHANNEL_HANDLE_FN, then call: resolveChannelHandle(input, apiKey, context)
  */
